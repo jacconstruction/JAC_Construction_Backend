@@ -9,10 +9,20 @@ const mongoose = require('mongoose');
 const app = express();
 const PORT = process.env.PORT || 5000;
 
+// Disable buffering so queries fail fast if not connected
+mongoose.set('bufferCommands', false);
+
 // Connect to MongoDB
-mongoose.connect(process.env.MONGODB_URI)
-  .then(() => console.log('Successfully connected to MongoDB.'))
-  .catch(err => console.error('Error connecting to MongoDB:', err));
+if (process.env.MONGODB_URI) {
+  mongoose.connect(process.env.MONGODB_URI, {
+    serverSelectionTimeoutMS: 5000 // Timeout after 5s instead of hanging
+  })
+    .then(() => console.log('Successfully connected to MongoDB.'))
+    .catch(err => console.error('Error connecting to MongoDB:', err));
+} else {
+  console.warn('MONGODB_URI is not defined in environment variables. Running in local backup mode.');
+}
+
 
 // Define Inquiry Schema & Model
 const inquirySchema = new mongoose.Schema({
@@ -242,19 +252,69 @@ app.post('/api/contact', async (req, res) => {
     return res.status(400).json({ error: 'All fields (name, email, phone, details) are required.' });
   }
 
+  // Check if MongoDB is connected
+  const isDbConnected = mongoose.connection.readyState === 1;
+
+  if (isDbConnected) {
+    try {
+      const newInquiry = new Inquiry({
+        name,
+        email,
+        phone,
+        details
+      });
+
+      await newInquiry.save();
+      return res.status(201).json({ 
+        message: 'Thank you! Your quote request has been received.', 
+        inquiry: newInquiry,
+        savedToDb: true
+      });
+    } catch (error) {
+      console.error('Failed to save inquiry to MongoDB, falling back to local file:', error);
+    }
+  } else {
+    console.warn('MongoDB is not connected. Saving inquiry to local backup.');
+  }
+
+  // Fallback to local inquiries.json if database is disconnected or save failed
   try {
-    const newInquiry = new Inquiry({
+    const filePath = path.join(__dirname, 'inquiries.json');
+    let inquiries = [];
+    if (fs.existsSync(filePath)) {
+      const fileData = fs.readFileSync(filePath, 'utf8');
+      try {
+        inquiries = JSON.parse(fileData);
+        if (!Array.isArray(inquiries)) {
+          inquiries = [];
+        }
+      } catch (parseErr) {
+        console.error('Error parsing inquiries.json:', parseErr);
+        inquiries = [];
+      }
+    }
+
+    const localInquiry = {
+      id: Date.now().toString(),
       name,
       email,
       phone,
-      details
-    });
+      details,
+      date: new Date().toISOString()
+    };
 
-    await newInquiry.save();
-    res.status(201).json({ message: 'Thank you! Your quote request has been received.', inquiry: newInquiry });
-  } catch (error) {
-    console.error('Failed to save inquiry to MongoDB:', error);
-    res.status(500).json({ error: 'Internal Server Error. Failed to submit inquiry.' });
+    inquiries.push(localInquiry);
+    fs.writeFileSync(filePath, JSON.stringify(inquiries, null, 2), 'utf8');
+    console.log('Successfully saved inquiry to local backup inquiries.json.');
+
+    return res.status(201).json({ 
+      message: 'Thank you! Your quote request has been received.', 
+      inquiry: localInquiry,
+      savedToDb: false
+    });
+  } catch (fallbackError) {
+    console.error('Failed to save to local backup inquiries.json:', fallbackError);
+    return res.status(500).json({ error: 'Failed to process inquiry. Please try again.' });
   }
 });
 
